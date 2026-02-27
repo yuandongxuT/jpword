@@ -90,10 +90,6 @@ def load_progress(words):
     else:
         progress = pd.DataFrame(columns=["key", "interval", "next_date", "correct", "wrong"])
 
-    for word in words:
-        if word["key"] not in progress["key"].values:
-            progress.loc[len(progress)] = [word["key"], 0, datetime.now().date(), 0, 0]
-
     return progress, is_first_run
 
 
@@ -107,11 +103,33 @@ def save_wrong(word):
     if os.path.exists(WRONG_FILE):
         wrong_df = pd.read_excel(WRONG_FILE)
     else:
-        wrong_df = pd.DataFrame(columns=["日语", "中文", "例句", "时间"])
+        wrong_df = pd.DataFrame(columns=["日语", "中文", "例句", "时间", "错误次数"])
 
-    wrong_df.loc[len(wrong_df)] = [
-        word["jp"], word["cn"], word["example"], datetime.now()
-    ]
+    # 确保有“错误次数”这一列
+    if "错误次数" not in wrong_df.columns:
+        wrong_df["错误次数"] = 0
+
+    jp = word["jp"]
+    cn = word["cn"]
+    example = word.get("example", "")
+    now = datetime.now()
+
+    # 查找是否已有同一单词（按 日语+中文 识别重复）
+    mask = (wrong_df["日语"] == jp) & (wrong_df["中文"] == cn)
+
+    if mask.any():
+        # 已存在：错误次数 +1，更新时间
+        idx = wrong_df.index[mask][0]
+        wrong_df.at[idx, "错误次数"] = (
+            pd.to_numeric(wrong_df.at[idx, "错误次数"], errors="coerce") if "错误次数" in wrong_df.columns else 0
+        )
+        wrong_df.at[idx, "错误次数"] = (wrong_df.at[idx, "错误次数"] or 0) + 1
+        wrong_df.at[idx, "时间"] = now
+        # 如需更新例句，可取消下一行注释
+        # wrong_df.at[idx, "例句"] = example
+    else:
+        # 新单词：从 1 次开始记录
+        wrong_df.loc[len(wrong_df)] = [jp, cn, example, now, 1]
 
     wrong_df.to_excel(WRONG_FILE, index=False)
 
@@ -143,24 +161,62 @@ def get_today_words(words, progress):
     return [w for w in words if w["key"] in due_keys]
 
 
-# ========= 出题 =========
-def quiz(words, progress, mode, is_first_run):
+# ========= 选择新学习单词 =========
+def get_new_words(words, progress, limit=50):
+    learned_keys = set(progress["key"].astype(str).tolist()) if not progress.empty else set()
+    new_words = [w for w in words if w["key"] not in learned_keys]
+    random.shuffle(new_words)
+    return new_words[:limit]
 
-    if is_first_run:
-        print("第一次运行：全量学习模式")
-        today_words = words
+
+# ========= 确保进度行存在（新学习会用到） =========
+def ensure_progress_row(progress, key: str):
+    idxs = progress.index[progress["key"] == key].tolist() if not progress.empty else []
+    if idxs:
+        return idxs[0], progress
+
+    progress.loc[len(progress)] = [key, 0, datetime.now().date(), 0, 0]
+    return progress.index[-1], progress
+
+
+# ========= 出题 =========
+def quiz(words, progress, direction_mode, session_mode, is_first_run):
+    word_by_key = {w["key"]: w for w in words}
+
+    if session_mode == "1":
+        # 新学习：从题库中取前 50 个未学习的词
+        today_words = get_new_words(words, progress, limit=50)
+        print(f"新学习模式：本次 {len(today_words)} 个新词")
     else:
+        # 复习：从已学习且到期（<=今天）的词中取最多 50 个
         today_words = get_today_words(words, progress)
+        # 优先复习更早到期的；同一天到期时，错得多的优先
+        if not progress.empty and today_words:
+            due = progress[progress["next_date"] <= datetime.now().date()].copy()
+            due["wrong"] = pd.to_numeric(due.get("wrong", 0), errors="coerce").fillna(0).astype(int)
+            due = due.sort_values(["next_date", "wrong"], ascending=[True, False])
+            ordered = []
+            seen = set()
+            for k in due["key"].astype(str).tolist():
+                if k in word_by_key and k not in seen:
+                    ordered.append(word_by_key[k])
+                    seen.add(k)
+            today_words = ordered[:50]
+        else:
+            today_words = today_words[:50]
+        print(f"复习模式：本次 {len(today_words)} 个到期词")
 
     if not today_words:
-        print("今天没有需要复习的单词！")
+        if session_mode == "1":
+            print("没有未学习的新单词了！")
+        else:
+            print("今天没有需要复习的单词！")
         return
 
-    word_by_key = {w["key"]: w for w in words}
     today_words = today_words[:]
-    random.shuffle(today_words)
+    if session_mode != "1":
+        random.shuffle(today_words)
 
-    today_words = today_words[:50]
     total = len(today_words)
     correct_count = 0
 
@@ -176,15 +232,18 @@ def quiz(words, progress, mode, is_first_run):
 
     for i, word in enumerate(today_words, start=1):
         key = word["key"]
-        idxs = progress.index[progress["key"] == key].tolist()
-        if not idxs:
-            continue
-        row_idx = idxs[0]
+        if session_mode == "1":
+            row_idx, progress = ensure_progress_row(progress, key)
+        else:
+            idxs = progress.index[progress["key"] == key].tolist()
+            if not idxs:
+                continue
+            row_idx = idxs[0]
 
         pos = word.get("pos") or ""
         pos_label = f" ({pos})" if pos else ""
 
-        if mode == "1":
+        if direction_mode == "1":
             prompt = f"[{i}/{total}] {word['jp']}{pos_label} -> "
             user_ans = input(prompt)
             expected = split_answers(word["cn"])
@@ -222,16 +281,26 @@ def main():
     progress, is_first_run = load_progress(words)
 
     print("日语单词出题器（艾宾浩斯版）")
+    print("出题方向：")
     print("1 日译中")
     print("2 中译日")
 
-    mode = input("请选择模式 (1/2)：").strip()
+    direction_mode = input("请选择出题方向 (1/2)：").strip()
 
-    if mode not in ["1", "2"]:
-        print("模式错误")
+    if direction_mode not in ["1", "2"]:
+        print("出题方向错误")
         return
 
-    quiz(words, progress, mode, is_first_run)
+    print("学习类型：")
+    print("1 新学习（从题库挑 50 个没学过的）")
+    print("2 复习（挑已学习且到期的，最多 50 个）")
+
+    session_mode = input("请选择学习类型 (1/2)：").strip()
+    if session_mode not in ["1", "2"]:
+        print("学习类型错误")
+        return
+
+    quiz(words, progress, direction_mode, session_mode, is_first_run)
 
 
 if __name__ == "__main__":
