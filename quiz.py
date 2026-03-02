@@ -93,6 +93,29 @@ def load_progress(words):
     return progress, is_first_run
 
 
+# ========= 学习进度统计 =========
+def show_statistics(words, progress):
+    total_words = len(words)
+
+    if progress.empty:
+        learned = 0
+        due_today = 0
+    else:
+        learned = progress["key"].nunique()
+        today = datetime.now().date()
+        due_today = (progress["next_date"] <= today).sum()
+
+    new_words = total_words - learned
+    percent = (learned / total_words * 100) if total_words else 0
+
+    print("\n📊 学习进度统计")
+    print(f"总单词数：{total_words}")
+    print(f"已学习：{learned}")
+    print(f"未学习：{new_words}")
+    print(f"今日待复习：{due_today}")
+    print(f"学习进度：{percent:.2f}%")
+    print("-" * 30)
+        
 # ========= 保存进度 =========
 def save_progress(progress):
     progress.to_excel(PROGRESS_FILE, index=False)
@@ -184,36 +207,33 @@ def quiz(words, progress, direction_mode, session_mode, is_first_run):
     word_by_key = {w["key"]: w for w in words}
 
     if session_mode == "1":
-        # 新学习：从题库中取前 50 个未学习的词
         today_words = get_new_words(words, progress, limit=50)
         print(f"新学习模式：本次 {len(today_words)} 个新词")
     else:
-        # 复习：从已学习且到期（<=今天）的词中取最多 50 个
         today_words = get_today_words(words, progress)
-        # 优先复习更早到期的；同一天到期时，错得多的优先
+
         if not progress.empty and today_words:
             due = progress[progress["next_date"] <= datetime.now().date()].copy()
             due["wrong"] = pd.to_numeric(due.get("wrong", 0), errors="coerce").fillna(0).astype(int)
             due = due.sort_values(["next_date", "wrong"], ascending=[True, False])
+
             ordered = []
             seen = set()
             for k in due["key"].astype(str).tolist():
                 if k in word_by_key and k not in seen:
                     ordered.append(word_by_key[k])
                     seen.add(k)
+
             today_words = ordered[:50]
         else:
             today_words = today_words[:50]
+
         print(f"复习模式：本次 {len(today_words)} 个到期词")
 
     if not today_words:
-        if session_mode == "1":
-            print("没有未学习的新单词了！")
-        else:
-            print("今天没有需要复习的单词！")
+        print("没有需要学习的单词！")
         return
 
-    today_words = today_words[:]
     if session_mode != "1":
         random.shuffle(today_words)
 
@@ -230,8 +250,17 @@ def quiz(words, progress, direction_mode, session_mode, is_first_run):
         parts = re.split(r"[;；/／、，,]|或", str(s))
         return [normalize(p) for p in parts if normalize(p)]
 
+    # 🔹 按词性分组，用于生成选择题
+    pos_dict = {}
+    for w in words:
+        pos = w.get("pos", "")
+        if pos not in pos_dict:
+            pos_dict[pos] = []
+        pos_dict[pos].append(w)
+
     for i, word in enumerate(today_words, start=1):
         key = word["key"]
+
         if session_mode == "1":
             row_idx, progress = ensure_progress_row(progress, key)
         else:
@@ -243,31 +272,62 @@ def quiz(words, progress, direction_mode, session_mode, is_first_run):
         pos = word.get("pos") or ""
         pos_label = f" ({pos})" if pos else ""
 
-        if direction_mode == "1":
-            prompt = f"[{i}/{total}] {word['jp']}{pos_label} -> "
-            user_ans = input(prompt)
-            expected = split_answers(word["cn"])
-            ok = normalize(user_ans) in expected if expected else (normalize(user_ans) == normalize(word["cn"]))
+        # =========================
+        # 🎯 接続詞 / 副詞 → 选择题（中译日）
+        # =========================
+        if pos in ["接続詞", "接续词", "副詞", "副词"]:
+            same_pos_words = pos_dict.get(pos, [])
+            candidates = [w for w in same_pos_words if w["key"] != word["key"]]
+
+            options = random.sample(candidates, min(3, len(candidates)))
+            options.append(word)
+            random.shuffle(options)
+
+            correct_index = options.index(word) + 1
+
+            print(f"\n[{i}/{total}] {word['cn']}{pos_label} 对应哪个日语？")
+            for idx, opt in enumerate(options, 1):
+                print(f"{idx}. {opt['jp']}")
+
+            user_ans = input("请选择 (1-4)：").strip()
+
+            if user_ans == str(correct_index):
+                print("正确")
+                ok = True
+                correct_count += 1
+            else:
+                print("错误")
+                print(f"正确答案：{correct_index}")
+                print(f"{word['jp']} ｜ {word['cn']}")
+                if word.get("example"):
+                    print(f"例句：{word['example']}")
+                save_wrong(word)
+                ok = False
+
+        # =========================
+        # 📝 普通词 → 中译日输入
+        # =========================
         else:
             prompt = f"[{i}/{total}] {word['cn']}{pos_label} -> "
             user_ans = input(prompt)
+
             expected = split_answers(word["jp"])
             ok = normalize(user_ans) in expected if expected else (normalize(user_ans) == normalize(word["jp"]))
 
-        if ok:
-            print("正确")
-            correct_count += 1
-        else:
-            print("错误")
-            print(f"正确答案：{word['jp']} ｜ {word['cn']}")
-            if word.get("example"):
-                print(f"例句：{word['example']}")
-            save_wrong(word)
+            if ok:
+                print("正确")
+                correct_count += 1
+            else:
+                print("错误")
+                print(f"正确答案：{word['jp']} ｜ {word['cn']}")
+                if word.get("example"):
+                    print(f"例句：{word['example']}")
+                save_wrong(word)
 
         progress.loc[row_idx] = update_interval(progress.loc[row_idx], ok)
 
     save_progress(progress)
-    print(f"完成：{correct_count}/{total} 正确")
+    print(f"\n完成：{correct_count}/{total} 正确")
 
 # ========= 主程序 =========
 def main():
@@ -280,16 +340,9 @@ def main():
     words = load_words()
     progress, is_first_run = load_progress(words)
 
+    show_statistics(words, progress)
+
     print("日语单词出题器（艾宾浩斯版）")
-    print("出题方向：")
-    print("1 日译中")
-    print("2 中译日")
-
-    direction_mode = input("请选择出题方向 (1/2)：").strip()
-
-    if direction_mode not in ["1", "2"]:
-        print("出题方向错误")
-        return
 
     print("学习类型：")
     print("1 新学习（从题库挑 50 个没学过的）")
@@ -299,6 +352,8 @@ def main():
     if session_mode not in ["1", "2"]:
         print("学习类型错误")
         return
+
+    direction_mode = "2"  # 固定中译日
 
     quiz(words, progress, direction_mode, session_mode, is_first_run)
 
