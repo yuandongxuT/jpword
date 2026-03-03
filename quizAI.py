@@ -4,10 +4,36 @@ import re
 from datetime import datetime, timedelta
 import os
 import sys
+import requests
+
+try:
+    import certifi  # type: ignore
+except Exception:
+    certifi = None
 
 WORD_FILE = "日本語単語.xlsx"
 PROGRESS_FILE = "progress.xlsx"
 WRONG_FILE = "wrong_words.xlsx"
+
+# DeepSeek 配置（默认按 DeepSeek OpenAI 兼容接口来调用）
+LLM_API_KEY = (
+    os.getenv("LLM_API_KEY")
+    or os.getenv("DEEPSEEK_API_KEY")
+    or os.getenv("OPENAI_API_KEY")
+)
+
+LLM_API_URL = os.getenv(
+    "LLM_API_URL",
+    # DeepSeek / OpenAI 兼容接口一般是 /v1/chat/completions
+    "https://api.deepseek.com/v1/chat/completions",
+)
+LLM_MODEL = os.getenv("LLM_MODEL", "deepseek-chat")
+
+# SSL/TLS 证书相关配置：
+# - LLM_SSL_VERIFY=0 可临时关闭证书校验（不推荐，只用于排障）
+# - LLM_CA_BUNDLE=证书路径 可指定自定义 CA（公司代理/抓包证书场景常用）
+LLM_SSL_VERIFY = os.getenv("LLM_SSL_VERIFY", "1").strip().lower() not in ("0", "false", "no")
+LLM_CA_BUNDLE = os.getenv("LLM_CA_BUNDLE") or os.getenv("REQUESTS_CA_BUNDLE")
 
 
 def configure_console_utf8():
@@ -17,11 +43,130 @@ def configure_console_utf8():
         except Exception:
             pass
 
+    # 确保控制台输入输出使用 UTF-8，避免日文乱码
     for stream in (sys.stdin, sys.stdout, sys.stderr):
         try:
             stream.reconfigure(encoding="utf-8", errors="replace")
         except Exception:
             pass
+
+
+def get_memory_tip_from_llm(word: dict) -> str | None:
+    """
+    调用大语言模型，为错误的单词生成记忆方法。
+
+    环境变量配置：
+      - LLM_API_KEY / DEEPSEEK_API_KEY / OPENAI_API_KEY：API 密钥（必填其一，否则不调用）
+      - LLM_API_URL：接口地址（默认 DeepSeek 的 chat/completions）
+      - LLM_MODEL：模型名（默认 deepseek-chat，可自行修改）
+    """
+    if not LLM_API_KEY:
+        print("[LLM] 未设置 DeepSeek/OpenAI API Key，已跳过记忆方法。")
+        return None
+
+    jp = str(word.get("jp", ""))
+    cn = str(word.get("cn", ""))
+    example = str(word.get("example", "") or "")
+
+    system_prompt = (
+        "你是一名日语单词记忆教练，请用简体中文、结合联想记忆、词源、构词法、谐音等方式，"
+        "为学习者设计该日语单词的记忆方法，语言要简洁、具体、便于快速记住。"
+    )
+
+    user_prompt = (
+        f"日语单词：{jp}\n"
+        f"中文含义：{cn}\n"
+        f"例句（可选）：{example or '无'}\n\n"
+        "请给出 1~2 条记忆方法，可以包括：\n"
+        "1. 简短的谐音联想\n"
+        "2. 与汉字含义或词源的联系\n"
+        "3. 在具体场景中的画面化记忆\n"
+        "回答时只给出记忆方法本身，不要解释你是 AI。"
+    )
+
+    headers = {
+        "Authorization": f"Bearer {LLM_API_KEY}",
+        "Content-Type": "application/json",
+    }
+
+    body = {
+        "model": LLM_MODEL,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        "temperature": 0.7,
+    }
+
+    verify_opt: bool | str = True
+    if not LLM_SSL_VERIFY:
+        verify_opt = False
+    elif LLM_CA_BUNDLE:
+        verify_opt = LLM_CA_BUNDLE
+    elif certifi is not None:
+        # 在部分 Windows 环境里，显式指定 certifi 更稳定
+        verify_opt = certifi.where()
+
+    if verify_opt is False:
+        print("[LLM] 警告：当前关闭了 HTTPS 证书校验（LLM_SSL_VERIFY=0），不安全且会触发 InsecureRequestWarning。")
+
+    try:
+        resp = requests.post(
+            LLM_API_URL,
+            headers=headers,
+            json=body,
+            timeout=20,
+            verify=verify_opt,
+        )
+
+        # 针对常见状态码给出可操作的提示
+        if resp.status_code == 401:
+            print("[LLM] 401 未授权：请检查 LLM_API_KEY/DEEPSEEK_API_KEY 是否正确。")
+            return None
+        if resp.status_code == 402:
+            print("[LLM] 402 Payment Required：账号余额/套餐不足或未开通，请在 DeepSeek 控制台充值/开通后再试。")
+            return None
+        if resp.status_code == 429:
+            print("[LLM] 429 请求过多：触发限流了，稍后再试。")
+            return None
+
+        resp.raise_for_status()
+
+        data = resp.json()
+
+        # 兼容 OpenAI / DeepSeek chat-completions 风格的响应结构
+        choices = data.get("choices")
+        if not choices:
+            print("[LLM] 响应中没有 choices 字段。")
+            return None
+
+        message = choices[0].get("message") or {}
+        content = message.get("content")
+        if isinstance(content, str):
+            return content.strip()
+
+        # 兜底：部分兼容接口可能直接返回 text
+        text = choices[0].get("text")
+        if isinstance(text, str):
+            return text.strip()
+
+        print("[LLM] 未能从返回结果中解析出文本内容。")
+
+    except requests.exceptions.SSLError as e:
+        print(f"[LLM] SSL 证书校验失败：{e}")
+        if LLM_CA_BUNDLE:
+            print(f"[LLM] 当前使用的 CA Bundle：{LLM_CA_BUNDLE}")
+        else:
+            print("[LLM] 可尝试：升级 certifi / 配置 REQUESTS_CA_BUNDLE 或 LLM_CA_BUNDLE（公司代理场景）。")
+    except requests.exceptions.RequestException as e:
+        print(f"[LLM] 网络请求失败：{e}")
+    except ValueError as e:
+        # JSON 解析失败等
+        print(f"[LLM] 响应解析失败：{e}")
+    except Exception as e:
+        print(f"[LLM] 调用大模型失败：{e}")
+
+    return None
 
 
 # ========= 解析单词 =========
@@ -188,8 +333,20 @@ def get_today_words(words, progress):
 def get_new_words(words, progress, limit=50):
     learned_keys = set(progress["key"].astype(str).tolist()) if not progress.empty else set()
     new_words = [w for w in words if w["key"] not in learned_keys]
-    random.shuffle(new_words)
-    return new_words[:limit]
+
+    # 优先选择「常句」部分的内容
+    priority = [w for w in new_words if "常句" in str(w.get("pos", ""))]
+    others = [w for w in new_words if w not in priority]
+
+    random.shuffle(priority)
+    random.shuffle(others)
+
+    selected = priority[:limit]
+    if len(selected) < limit:
+        need = limit - len(selected)
+        selected.extend(others[:need])
+
+    return selected
 
 
 # ========= 确保进度行存在（新学习会用到） =========
@@ -224,7 +381,10 @@ def quiz(words, progress, direction_mode, session_mode, is_first_run):
                     ordered.append(word_by_key[k])
                     seen.add(k)
 
-            today_words = ordered[:50]
+            # 在到期词中优先「常句」部分
+            priority = [w for w in ordered if "常句" in str(w.get("pos", ""))]
+            others = [w for w in ordered if w not in priority]
+            today_words = (priority + others)[:50]
         else:
             today_words = today_words[:50]
 
@@ -332,6 +492,10 @@ def quiz(words, progress, direction_mode, session_mode, is_first_run):
                     if word.get("example"):
                         print(f"例句：{word['example']}")
                     save_wrong(word)
+                    tip = get_memory_tip_from_llm(word)
+                    if tip:
+                        print("\n记忆方法（大模型建议）：")
+                        print(tip)
                     ok = False
             else:
                 prompt = f"[{i}/{total}] {word['cn']}{pos_label} -> "
@@ -351,6 +515,10 @@ def quiz(words, progress, direction_mode, session_mode, is_first_run):
                     if word.get("example"):
                         print(f"例句：{word['example']}")
                     save_wrong(word)
+                    tip = get_memory_tip_from_llm(word)
+                    if tip:
+                        print("\n记忆方法（大模型建议）：")
+                        print(tip)
 
         # =========================
         # 📝 普通词 → 中译日输入
@@ -373,6 +541,10 @@ def quiz(words, progress, direction_mode, session_mode, is_first_run):
                 if word.get("example"):
                     print(f"例句：{word['example']}")
                 save_wrong(word)
+                tip = get_memory_tip_from_llm(word)
+                if tip:
+                    print("\n记忆方法（大模型建议）：")
+                    print(tip)
 
         progress.loc[row_idx] = update_interval(progress.loc[row_idx], ok)
 
