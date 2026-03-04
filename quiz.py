@@ -95,15 +95,19 @@ def load_progress(words):
 
 # ========= 学习进度统计 =========
 def show_statistics(words, progress):
-    total_words = len(words)
+    special_pos = {"接続詞", "接续词", "副詞", "副词"}
+    special_keys = {w.get("key") for w in words if (w.get("pos") or "") in special_pos}
+
+    # 学习进度统计：不统计接续词/副词
+    total_words = sum(1 for w in words if w.get("key") not in special_keys)
 
     if progress.empty:
         learned = 0
         due_today = 0
     else:
-        learned = progress["key"].nunique()
+        learned = progress[~progress["key"].isin(special_keys)]["key"].nunique()
         today = datetime.now().date()
-        due_today = (progress["next_date"] <= today).sum()
+        due_today = ((progress["next_date"] <= today) & (~progress["key"].isin(special_keys))).sum()
 
     new_words = total_words - learned
     percent = (learned / total_words * 100) if total_words else 0
@@ -175,6 +179,22 @@ def update_interval(row, correct):
     return row
 
 
+# ========= 只更新复习排期（不计入 correct/wrong 统计） =========
+def update_schedule_only(row, correct=True):
+    intervals = [1, 3, 7, 15, 30]
+
+    if correct:
+        idx = int(row["interval"])
+        if idx < len(intervals):
+            row["next_date"] = datetime.now().date() + timedelta(days=intervals[idx])
+            row["interval"] = idx + 1
+    else:
+        row["interval"] = 0
+        row["next_date"] = datetime.now().date()
+
+    return row
+
+
 # ========= 获取今日要复习的词 =========
 def get_today_words(words, progress):
     today = datetime.now().date()
@@ -239,6 +259,8 @@ def quiz(words, progress, direction_mode, session_mode, is_first_run):
 
     total = len(today_words)
     correct_count = 0
+    scored_total = 0
+    special_shown = 0
 
     def normalize(s: str) -> str:
         s = str(s)
@@ -279,14 +301,6 @@ def quiz(words, progress, direction_mode, session_mode, is_first_run):
             acc |= expanded
         return acc
 
-    # 🔹 按词性分组，用于生成选择题
-    pos_dict = {}
-    for w in words:
-        pos = w.get("pos", "")
-        if pos not in pos_dict:
-            pos_dict[pos] = []
-        pos_dict[pos].append(w)
-
     for i, word in enumerate(today_words, start=1):
         key = word["key"]
 
@@ -302,55 +316,18 @@ def quiz(words, progress, direction_mode, session_mode, is_first_run):
         pos_label = f" ({pos})" if pos else ""
 
         # =========================
-        # 🎯 接続詞 / 副詞 → 选择题（中译日）
+        # 🎯 接续词 / 副词 → 只展示答案与例句，不要求作答
         # =========================
         if pos in ["接続詞", "接续词", "副詞", "副词"]:
-            same_pos_words = pos_dict.get(pos, [])
-            candidates = [w for w in same_pos_words if w["key"] != word["key"]]
+            print(f"\n[{i}/{total}] {word['jp']}{pos_label}")
+            print(f"答案：{word['jp']} ｜ {word['cn']}")
+            if word.get("example"):
+                print(f"例句：{word['example']}")
 
-            # 至少要有 3 个干扰项，才能凑满 4 选 1；否则退化为输入题
-            if len(candidates) >= 3:
-                options = random.sample(candidates, 3) + [word]
-                random.shuffle(options)
-
-                correct_index = options.index(word) + 1
-
-                print(f"\n[{i}/{total}] {word['cn']}{pos_label} 对应哪个日语？")
-                for idx, opt in enumerate(options, 1):
-                    print(f"{idx}. {opt['jp']}")
-
-                user_ans = input("请选择 (1-4)：").strip()
-
-                if user_ans == str(correct_index):
-                    print("正确")
-                    ok = True
-                    correct_count += 1
-                else:
-                    print("错误")
-                    print(f"正确答案：{correct_index}")
-                    print(f"{word['jp']} ｜ {word['cn']}")
-                    if word.get("example"):
-                        print(f"例句：{word['example']}")
-                    save_wrong(word)
-                    ok = False
-            else:
-                prompt = f"[{i}/{total}] {word['cn']}{pos_label} -> "
-                user_ans = input(prompt)
-
-                expected_norm = split_answers(word["jp"])
-                if not expected_norm:
-                    expected_norm = [normalize(word["jp"])]
-                ok = normalize(user_ans) in acceptable_jp_answers(expected_norm, pos, word.get("cn", ""))
-
-                if ok:
-                    print("正确")
-                    correct_count += 1
-                else:
-                    print("错误")
-                    print(f"正确答案：{word['jp']} ｜ {word['cn']}")
-                    if word.get("example"):
-                        print(f"例句：{word['example']}")
-                    save_wrong(word)
+            # 不计入学习进度统计（correct/wrong），但仍推进复习排期，避免每天重复出现
+            progress.loc[row_idx] = update_schedule_only(progress.loc[row_idx], True)
+            special_shown += 1
+            continue
 
         # =========================
         # 📝 普通词 → 中译日输入
@@ -364,6 +341,7 @@ def quiz(words, progress, direction_mode, session_mode, is_first_run):
                 expected_norm = [normalize(word["jp"])]
             ok = normalize(user_ans) in acceptable_jp_answers(expected_norm, pos, word.get("cn", ""))
 
+            scored_total += 1
             if ok:
                 print("正确")
                 correct_count += 1
@@ -377,7 +355,11 @@ def quiz(words, progress, direction_mode, session_mode, is_first_run):
         progress.loc[row_idx] = update_interval(progress.loc[row_idx], ok)
 
     save_progress(progress)
-    print(f"\n完成：{correct_count}/{total} 正确")
+    if scored_total == 0:
+        print("\n完成：本次没有需要作答的题目")
+    else:
+        extra = f"（另展示 {special_shown} 个接续词/副词不计入统计）" if special_shown else ""
+        print(f"\n完成：{correct_count}/{scored_total} 正确{extra}")
 
 # ========= 主程序 =========
 def main():
